@@ -14,7 +14,8 @@ from dateutil import relativedelta
 from googleapiclient.http import BatchHttpRequest
 import redis
 import google_auth_httplib2  # New import
-
+from langchain_ollama import ChatOllama
+from langchain_core.prompts import ChatPromptTemplate
 
 app = FastAPI()
 app.add_middleware(
@@ -110,7 +111,7 @@ async def get_emails():
         service = build('gmail', 'v1', credentials=credentials)
         
         three_months_ago = datetime.datetime.now() - relativedelta.relativedelta(months=3)
-        query = f"after:{three_months_ago.strftime('%Y/%m/%d')}"
+        query = "after:2024/11/01 before:2025/02/01"
 
         # Fetch message IDs with pagination
         email_ids = []
@@ -176,7 +177,19 @@ async def get_email_details(limit: int = 100):
         if not email_ids:
             return {"emails": [], "total": 0, "message": "No IDs stored"}
 
-        email_ids = list(email_ids)[:limit]  # Limit to requested number
+        email_ids = list(email_ids) # Limit to requested number
+
+        result = {
+            "application_submitted": 0,
+            "application_rejected": 0,
+            "application_viewed": 0,
+            "assignment_given": 0,
+            "interview_scheduled": 0,
+            "interview_rejected": 0,
+            "offer_letter_received": 0,
+            "offer_released": 0,
+            "not_job_related": 0
+        }
 
         # Async function to fetch full email content
         async def fetch_email(email_id):
@@ -223,8 +236,104 @@ async def get_email_details(limit: int = 100):
 
                 email_info['body'] = body
 
-                # Store in Redis
-                redis_client.setex(msg['id'], 3600, json.dumps(email_info))
+                llm = ChatOllama(
+                    model="llama3.2:1b",
+                    temperature=0,
+                    # other params...
+                )
+
+
+                improved_prompt = """You are a highly accurate email classification assistant focused specifically on DIRECT job application communications. 
+Your task is to analyze the given email content and categorize it into one of the predefined categories.
+
+First, determine if the email is directly related to a specific job application process you've personally initiated. 
+Look for personalized communications about YOUR specific applications, interviews, and offers.
+
+IMPORTANT: Classify as "not_job_related" if the email is:
+- A job alert (notifications about new job postings)
+- A promotional email from job sites
+- A newsletter from a company
+- A generic recruitment message not tied to your specific application
+- Any email that is not about a specific job you've applied for
+
+If the email is NOT directly related to a specific job application YOU submitted, respond with:
+not_job_related
+
+If the email IS directly related to YOUR specific job application, categorize it into ONE of these categories:
+- application_submitted: Confirmation that your job application was received or submitted
+- application_rejected: Rejection at the application stage before interviews
+- assignment_given: Request to complete a technical assessment, coding challenge, or assignment
+- interview_scheduled: Invitation to an interview or confirmation of interview details
+- interview_rejected: Rejection after an interview stage
+- offer_letter_received: Job offer or notification that an offer letter is available
+- offer_released: Notification that a job offer is no longer available or has expired
+
+Return ONLY the category name without any additional text or explanation.
+
+Examples:
+
+Example 1:
+Subject: Your application to Software Developer at TechCorp
+Body: Thank you for submitting your application to TechCorp. We have received your resume and will review it shortly.
+RETURN: application_submitted
+
+Example 2:
+Subject: New jobs that match your profile: 5 Software Developer roles
+Body: We found 5 new job postings that match your preferences. Click here to view them.
+RETURN: not_job_related
+
+Example 2:
+Subject: Your application was viewed by Wise AI
+Body: Your application was viewed by Wise AI
+RETURN: not_job_related
+
+Example 3:
+Subject: Next steps - Technical Assessment for Senior Engineer position
+Body: We were impressed with your application and would like you to complete a coding challenge. Please find attached the requirements and submit within 5 days.
+RETURN: assignment_given
+
+Example 4:
+Subject: Weekly job alerts from Indeed
+Body: Here are this week's top job recommendations based on your profile and search history.
+RETURN: not_job_related
+
+Example 5:
+Subject: Special offer: Upgrade to Premium for more job applications
+Body: Upgrade your account to apply to unlimited jobs and get seen by more recruiters!
+RETURN: not_job_related"""
+
+                prompt_template = ChatPromptTemplate([
+                    ("system", improved_prompt),
+                    ("user", "Here is the email content:\n\nSubject: {subject}\nFrom: {from}\nBody: {body}")
+                ])
+
+                chain = prompt_template | llm
+                ai_msg = chain.invoke({
+                    "subject": email_info.get("subject", ""),
+                    "from": email_info.get("from", ""),
+                    "body": email_info.get("body", "")[:1000]  # Limit to first 1000 chars for efficiency
+                })
+                
+                category = ai_msg.content.strip()
+                print(f"email_content {email_info.get("body", "")[:1000]}")
+                print(f"Classified as: {category}")
+
+                # Update result counter if category is valid
+                if category in result:
+                    result[category] += 1
+                else:
+                    # Default to not_job_related if invalid category returned
+                    print(f"Invalid category returned: {category}, defaulting to not_job_related")
+                    result["not_job_related"] += 1
+                    category = "not_job_related"
+                
+                # Add classification to email_info
+                email_info["category"] = category
+                
+                # Only store job-related emails in Redis
+                if category != "not_job_related":
+                    redis_client.setex(msg['id'], 3600, json.dumps(email_info))
+                
                 return email_info
             except Exception as e:
                 print(f"Error fetching {email_id}: {e}")
@@ -234,11 +343,15 @@ async def get_email_details(limit: int = 100):
         tasks = [fetch_email(email_id) for email_id in email_ids]
         email_list = await asyncio.gather(*tasks)
         email_list = [email for email in email_list if email is not None]  # Filter out failures
+        
+        # Filter to only include job-related emails in response
+        job_related_emails = [email for email in email_list if email.get("category") != "not_job_related"]
 
         return {
-            "emails": email_list,
-            "total": len(email_list),
-            "period": "Last 3 months"
+            "total_job_related": len(job_related_emails),
+            "total_processed": len(email_list),
+            "period": "Last 3 months",
+            "categories": result  # Include the category counts in the response
         }
 
     except Exception as e:
@@ -247,3 +360,4 @@ async def get_email_details(limit: int = 100):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+

@@ -6,3 +6,5 @@ google-api-python-client
 python-dateutil
 redis
 google-auth-httplib2
+langchain-ollama
+langchain
