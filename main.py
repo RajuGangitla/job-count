@@ -357,6 +357,23 @@ RETURN: not_job_related"""
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
+@app.post("/agent")
+async def testagent():
+    try:
+        llm = ChatOllama(
+                model="llama3.2:1b",
+                temperature=0,
+            )
+
+        prompt = ChatPromptTemplate([
+            ("system", "you are a agent ")
+        ])
+
+        print("s")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
