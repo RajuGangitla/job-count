@@ -8,3 +8,4 @@ redis
 google-auth-httplib2
 langchain-ollama
 langchain
+html2text

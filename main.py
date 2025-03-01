@@ -12,8 +12,10 @@ import os
 import datetime
 from dateutil import relativedelta
 from googleapiclient.http import BatchHttpRequest
+from langchain.output_parsers.json import SimpleJsonOutputParser
 import redis
-import google_auth_httplib2  # New import
+import html2text
+import re
 from langchain_ollama import ChatOllama
 from langchain_core.prompts import ChatPromptTemplate
 
@@ -191,6 +193,36 @@ async def get_email_details(limit: int = 100):
             "not_job_related": 0
         }
 
+        def extract_text_from_payload(payload):
+            body = ""
+            if 'parts' in payload:  # Multipart email
+                for part in payload['parts']:
+                    mime_type = part.get('mimeType', '')
+                    if mime_type == 'text/plain':
+                        data = part['body'].get('data')
+                        if data:
+                            body = base64.urlsafe_b64decode(data).decode('utf-8', errors='ignore')
+                            break
+                    elif mime_type == 'text/html' and not body:
+                        data = part['body'].get('data')
+                        if data:
+                            html_content = base64.urlsafe_b64decode(data).decode('utf-8', errors='ignore')
+                            body = html2text.html2text(html_content)  # Convert HTML to plain text
+                    elif mime_type.startswith('multipart'):
+                        nested_body = extract_text_from_payload(part)
+                        if nested_body:
+                            body = nested_body
+                            break
+            else:  # Simple email (no parts)
+                data = payload.get('body', {}).get('data')
+                if data:
+                    body = base64.urlsafe_b64decode(data).decode('utf-8', errors='ignore')
+            
+            # Clean the text
+            if body:
+                body = re.sub(r'\s+', ' ', body).strip()  # Normalize whitespace
+            return body
+
         # Async function to fetch full email content
         async def fetch_email(email_id):
             try:
@@ -200,158 +232,104 @@ async def get_email_details(limit: int = 100):
                     format='full'  # Get full content
                 ).execute()
 
-                email_info = {
-                    'id': msg['id'],
-                    'snippet': msg.get('snippet', '')
-                }
-
-                # Extract headers
+                # Extract subject from headers
+                subject = ""
                 headers = msg.get('payload', {}).get('headers', [])
                 for header in headers:
-                    if header['name'] == 'From':
-                        email_info['from'] = header['value']
-                    elif header['name'] == 'Subject':
-                        email_info['subject'] = header['value']
-                    elif header['name'] == 'Date':
-                        email_info['date'] = header['value']
+                    if header['name'] == 'Subject':
+                        subject = header['value']
+                        break
 
-                # Extract full text content
-                body = ""
+                # Extract body
                 payload = msg.get('payload', {})
-                if 'parts' in payload:  # Multipart email
-                    for part in payload['parts']:
-                        if part['mimeType'] == 'text/plain':
-                            data = part['body'].get('data')
-                            if data:
-                                body = base64.urlsafe_b64decode(data).decode('utf-8')
-                                break
-                        elif part['mimeType'] == 'text/html' and not body:  # Fallback to HTML
-                            data = part['body'].get('data')
-                            if data:
-                                body = base64.urlsafe_b64decode(data).decode('utf-8')
-                else:  # Simple text email
-                    data = payload.get('body', {}).get('data')
-                    if data:
-                        body = base64.urlsafe_b64decode(data).decode('utf-8')
+                body = extract_text_from_payload(payload)
 
-                email_info['body'] = body
+                # Combine subject and body into content
+                content = f"Subject: {subject}\nBody: {body}" if subject and body else body or subject
 
                 llm = ChatOllama(
-                    model="llama3.2:1b",
+                    model="phi3",
                     temperature=0,
-                    # other params...
                 )
+                json_parser = SimpleJsonOutputParser()
 
+                system_prompt = """
+        Analyze the provided email content and return a JSON object with a `category` key that best matches the email. 
 
-                improved_prompt = """You are a highly accurate email classification assistant focused specifically on DIRECT job application communications. 
-Your task is to analyze the given email content and categorize it into one of the predefined categories.
+        ### **Categories & Descriptions**  
+        - **`application_submitted`** → The candidate has successfully applied for a job.  
+        *Example: "Thank you for your application to [Company Name]. We have received your resume and will review it soon."*  
+        - **`application_viewed`** → The employer has reviewed the application but has not responded yet.  
+        *Example: "Your application for [Job Title] has been viewed by the hiring manager."*  
+        - **`application_rejected`** → The job application was rejected before any interview.  
+        *Example: "We appreciate your interest, but we have decided to move forward with other candidates at this time."*  
+        - **`assignment_given`** → The candidate has been given a task or test.  
+        *Example: "Please complete the attached coding challenge and submit it within the next 48 hours."*  
+        - **`interview_scheduled`** → The candidate has been invited for an interview.  
+        *Example: "We would like to schedule an interview with you for the [Job Title] position on [Date]."*  
+        - **`interview_rejected`** → The candidate was rejected after an interview.  
+        *Example: "Thank you for interviewing with us. Unfortunately, we have decided to move forward with another candidate."*  
+        - **`offer_letter_received`** → The candidate has received a job offer.  
+        *Example: "We are pleased to offer you the position of [Job Title] at [Company Name]. Please find the offer letter attached."*  
+        - **`offer_released`** → The offer has been finalized and the candidate is officially hired.  
+        *Example: "Your employment contract has been signed, and we look forward to your joining date on [Date]."*  
+        - **`not_job_related`** → The email does not belong to any of the above categories.  
+        *Example: Spam emails, newsletters, promotional messages, or personal emails.*  
 
-First, determine if the email is directly related to a specific job application process you've personally initiated. 
-Look for personalized communications about YOUR specific applications, interviews, and offers.
+        ### **Instructions**  
+        - Return only a JSON object in this format: `{{"category": "<selected_category>"}}`  
+        - Do **not** add explanations or extra text.  
+        - Select the most relevant category based on the email content.  
 
-IMPORTANT: Classify as "not_job_related" if the email is:
-- A job alert (notifications about new job postings)
-- A promotional email from job sites
-- A newsletter from a company
-- A generic recruitment message not tied to your specific application
-- Any email that is not about a specific job you've applied for
-
-If the email is NOT directly related to a specific job application YOU submitted, respond with:
-not_job_related
-
-If the email IS directly related to YOUR specific job application, categorize it into ONE of these categories:
-- application_submitted: Confirmation that your job application was received or submitted
-- application_rejected: Rejection at the application stage before interviews
-- assignment_given: Request to complete a technical assessment, coding challenge, or assignment
-- interview_scheduled: Invitation to an interview or confirmation of interview details
-- interview_rejected: Rejection after an interview stage
-- offer_letter_received: Job offer or notification that an offer letter is available
-- offer_released: Notification that a job offer is no longer available or has expired
-
-Return ONLY the category name without any additional text or explanation.
-
-Examples:
-
-Example 1:
-Subject: Your application to Software Developer at TechCorp
-Body: Thank you for submitting your application to TechCorp. We have received your resume and will review it shortly.
-RETURN: application_submitted
-
-Example 2:
-Subject: New jobs that match your profile: 5 Software Developer roles
-Body: We found 5 new job postings that match your preferences. Click here to view them.
-RETURN: not_job_related
-
-Example 2:
-Subject: Your application was viewed by Wise AI
-Body: Your application was viewed by Wise AI
-RETURN: not_job_related
-
-Example 3:
-Subject: Next steps - Technical Assessment for Senior Engineer position
-Body: We were impressed with your application and would like you to complete a coding challenge. Please find attached the requirements and submit within 5 days.
-RETURN: assignment_given
-
-Example 4:
-Subject: Weekly job alerts from Indeed
-Body: Here are this week's top job recommendations based on your profile and search history.
-RETURN: not_job_related
-
-Example 5:
-Subject: Special offer: Upgrade to Premium for more job applications
-Body: Upgrade your account to apply to unlimited jobs and get seen by more recruiters!
-RETURN: not_job_related"""
+        ### **Email Content:**  
+        {content}
+        """
 
                 prompt_template = ChatPromptTemplate([
-                    ("system", improved_prompt),
-                    ("user", "Here is the email content:\n\nSubject: {subject}\nFrom: {from}\nBody: {body}")
+                    ("system", system_prompt)
                 ])
 
-                chain = prompt_template | llm
-                ai_msg = chain.invoke({
-                    "subject": email_info.get("subject", ""),
-                    "from": email_info.get("from", ""),
-                    "body": email_info.get("body", "")[:1000]  # Limit to first 1000 chars for efficiency
-                })
+                chain = prompt_template | llm | json_parser
+                ai_msg = chain.invoke({"content": content[:1000]})  # ai_msg is now a dict like {"category": "..."}
                 
-                category = ai_msg.content.strip()
-                print(f"email_content {email_info.get("body", "")[:1000]}")
+                # Directly access the 'category' key from the parsed dictionary
+                category = ai_msg.get("category", "not_job_related")  # Default to "not_job_related" if key is missing
+
+                print(f"email_content: {content[:1000]}")
                 print(f"Classified as: {category}")
 
-                # Update result counter if category is valid
+                # Update result counter
                 if category in result:
                     result[category] += 1
                 else:
-                    # Default to not_job_related if invalid category returned
                     print(f"Invalid category returned: {category}, defaulting to not_job_related")
                     result["not_job_related"] += 1
                     category = "not_job_related"
-                
-                # Add classification to email_info
-                email_info["category"] = category
-                
-                # Only store job-related emails in Redis
+
+                # Store job-related emails in Redis with content
                 if category != "not_job_related":
-                    redis_client.setex(msg['id'], 3600, json.dumps(email_info))
-                
-                return email_info
+                    redis_client.setex(msg['id'], 3600, json.dumps({"content": content, "category": category}))
+
+                return content
+
             except Exception as e:
                 print(f"Error fetching {email_id}: {e}")
                 return None
 
         # Run parallel fetches
         tasks = [fetch_email(email_id) for email_id in email_ids]
-        email_list = await asyncio.gather(*tasks)
-        email_list = [email for email in email_list if email is not None]  # Filter out failures
-        
-        # Filter to only include job-related emails in response
-        job_related_emails = [email for email in email_list if email.get("category") != "not_job_related"]
+        content_list = await asyncio.gather(*tasks)
+        content_list = [content for content in content_list if content is not None]  # Filter out failures
+
+        # Filter job-related content (based on what was stored in Redis or result)
+        job_related_content = [content for content in content_list if "not_job_related" not in result or result["not_job_related"] < len(content_list)]
 
         return {
-            "total_job_related": len(job_related_emails),
-            "total_processed": len(email_list),
+            "content_list": job_related_content,  # List of "Subject: ... Body: ..." strings
+            "total_job_related": len(job_related_content),
+            "total_processed": len(content_list),
             "period": "Last 3 months",
-            "categories": result  # Include the category counts in the response
+            "categories": result
         }
 
     except Exception as e:
